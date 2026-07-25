@@ -19,6 +19,12 @@ runtime catalog revision
 matches a reviewed toolchain entry. It must never derive an arbitrary download
 URL at compile time.
 
+Minecraft IDs are bounded canonical numeric identifiers: legacy `1.x.y` IDs
+and reviewed modern IDs such as `26.2` are syntactically valid. Syntax alone
+never authorizes a version: paths, whitespace/control characters, URLs,
+commands, non-canonical numerals, and every tuple absent from the reviewed
+catalog must fail closed.
+
 ## Scope
 
 Work only in:
@@ -117,6 +123,7 @@ Java 16 Forge or Fabric 1.17
 Java 17 Fabric
 Java 21 NeoForge
 Java 25 current official component
+Java 25 Fabric `26.2` (`0.19.3`)
 ```
 
 Do not claim general all-version loader support until those reviewed entries

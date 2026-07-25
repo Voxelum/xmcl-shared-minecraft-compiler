@@ -282,6 +282,25 @@ test("catalog generation rejects redirect, foreign host, missing or mismatched c
     }),
     /candidate_invalid/,
   );
+  for (const minecraftVersion of [
+    " 26.2",
+    "26.2 ",
+    "26.02",
+    "../26.2",
+    "https://example.test/26.2",
+    "26.2;cmd",
+    "26.2\n",
+  ]) {
+    await assert.rejects(
+      () => generateToolchainCatalog({
+        runtimeCatalogBytes: runtimeCatalog(forge),
+        fetchImpl: fixtureNetwork(forge).fetch,
+        candidates: [{ ...forge[0], minecraftVersion }],
+      }),
+      /candidate_invalid/,
+      minecraftVersion,
+    );
+  }
   await assert.rejects(
     () => generateToolchainCatalog({
       runtimeCatalogBytes: runtimeCatalog(forge),
