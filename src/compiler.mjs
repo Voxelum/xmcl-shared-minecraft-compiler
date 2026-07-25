@@ -14,18 +14,30 @@ const failureCodes = new Set([
  * master credential, node grant, or browser credential.
  */
 export class CompilerWorker {
-  constructor({ controlPlane, builder = new FailClosedRuntimeBuilder(), fetchImpl = fetch }) {
+  constructor({
+    controlPlane,
+    builder = new FailClosedRuntimeBuilder(),
+    fetchImpl = fetch,
+    requestTimeoutMs = 30_000,
+  }) {
+    if (!Number.isSafeInteger(requestTimeoutMs) || requestTimeoutMs < 1_000 ||
+      requestTimeoutMs > 120_000) {
+      throw new TypeError("invalid compiler request timeout");
+    }
     this.controlPlane = controlPlane;
     this.builder = builder;
     this.fetch = fetchImpl;
+    this.requestTimeoutMs = requestTimeoutMs;
   }
 
   async run(job) {
     try {
-      validateJob(job);
+      validateCompilerJob(job);
       const grants = await this.controlPlane.getGrants(job.deploymentId);
       const { input, output } = verifyGrantSet(grants, job);
-      const archive = await downloadExact(this.fetch, input, job.frozenManifest.archive);
+      const archive = await downloadExact(this.fetch, input, job.frozenManifest.archive, {
+        timeoutMs: this.requestTimeoutMs,
+      });
       const bundle = await validateBundle(archive, job.frozenManifest);
       const built = await this.builder.build({
         bundle,
@@ -33,7 +45,7 @@ export class CompilerWorker {
         expectedContentKey: job.expectedContentKey,
       });
       verifyBuiltContent(built, job);
-      await uploadExact(this.fetch, output, built.archive);
+      await uploadExact(this.fetch, output, built.archive, { timeoutMs: this.requestTimeoutMs });
       await this.controlPlane.publish({
         deploymentId: job.deploymentId,
         manifestSha256: job.manifestSha256,
@@ -87,7 +99,7 @@ export function createReviewedCompilerWorker({
   });
 }
 
-export function verifyGrantSet(grants, job) {
+export function verifyGrantSet(grants, job, { now = Date.now(), requireUnexpired = false } = {}) {
   if (!grants || grants.accountId !== job.accountId ||
     grants.serviceId !== job.serviceId || grants.deploymentId !== job.deploymentId ||
     grants.manifestSha256 !== job.manifestSha256 || !Array.isArray(grants.grants)) {
@@ -100,45 +112,55 @@ export function verifyGrantSet(grants, job) {
     input.key !== job.frozenManifest.archive.key ||
     output.key !== job.expectedContentKey ||
     !isExactSignedGrant(input, "GET") || !isExactSignedGrant(output, "PUT") ||
-    output.headers?.["if-none-match"] !== "*" ||
-    Object.keys(output.headers ?? {}).length !== 1
+    !hasExactHeaders(input.headers, {}) ||
+    !hasExactHeaders(output.headers, { "if-none-match": "*" }) ||
+    (requireUnexpired && (!validNow(now) || grantExpiresAt(input) <= now || grantExpiresAt(output) <= now))
   ) throw new CompilerFailure("invalid_grants");
   return { input, output };
 }
 
-export async function downloadExact(fetchImpl, grant, expected) {
-  const response = await fetchImpl(grant.url, {
+export async function downloadExact(fetchImpl, grant, expected, { timeoutMs = 30_000 } = {}) {
+  return await exactRequest(fetchImpl, grant.url, {
     method: "GET",
     headers: grant.headers,
     redirect: "error",
+  }, timeoutMs, "input_download_failed", async (response) => {
+    if (!response.ok || response.redirected ||
+      (response.url && new URL(response.url).href !== new URL(grant.url).href)) {
+      throw new CompilerFailure("input_download_failed");
+    }
+    const length = Number(response.headers.get("content-length") ?? 0);
+    if (!Number.isSafeInteger(length) || length < 1 || length > MAX_BUNDLE_BYTES ||
+      length !== expected.sizeBytes) {
+      throw new CompilerFailure("input_size_mismatch");
+    }
+    const bytes = await readExactBody(response, expected.sizeBytes);
+    if (bytes.byteLength !== expected.sizeBytes || sha256(bytes) !== expected.sha256) {
+      throw new CompilerFailure("input_hash_mismatch");
+    }
+    return bytes;
   });
-  if (!response.ok) throw new CompilerFailure("input_download_failed");
-  const length = Number(response.headers.get("content-length") ?? 0);
-  if (!Number.isSafeInteger(length) || length < 1 || length > MAX_BUNDLE_BYTES ||
-    length !== expected.sizeBytes) {
-    throw new CompilerFailure("input_size_mismatch");
-  }
-  const bytes = new Uint8Array(await response.arrayBuffer());
-  if (bytes.byteLength !== expected.sizeBytes || sha256(bytes) !== expected.sha256) {
-    throw new CompilerFailure("input_hash_mismatch");
-  }
-  return bytes;
 }
 
-async function uploadExact(fetchImpl, grant, archive) {
-  const response = await fetchImpl(grant.url, {
+async function uploadExact(fetchImpl, grant, archive, { timeoutMs = 30_000 } = {}) {
+  await exactRequest(fetchImpl, grant.url, {
     method: "PUT",
     headers: grant.headers,
     body: archive,
     redirect: "error",
+  }, timeoutMs, "content_upload_failed", async (response) => {
+    if (!response.ok || response.redirected ||
+      (response.url && new URL(response.url).href !== new URL(grant.url).href)) {
+      throw new CompilerFailure("content_upload_failed");
+    }
   });
-  if (!response.ok) throw new CompilerFailure("content_upload_failed");
 }
 
-function validateJob(job) {
+export function validateCompilerJob(job) {
   if (!job || typeof job !== "object" ||
-    !validId(job.accountId) || !validId(job.serviceId) || !validId(job.deploymentId) ||
-    !validSha256(job.manifestSha256) || !validId(job.compilerRequestId) ||
+    !validKeySegment(job.accountId) || !validKeySegment(job.serviceId) ||
+    !validKeySegment(job.deploymentId) || !validSha256(job.manifestSha256) ||
+    !validKeySegment(job.compilerRequestId) ||
     typeof job.expectedContentKey !== "string" ||
     job.frozenManifest?.sourceFormat !== "xmcl_server_bundle") {
     throw new CompilerFailure("invalid_job");
@@ -146,7 +168,8 @@ function validateJob(job) {
   const archive = job.frozenManifest?.archive;
   if (!archive || !validSha256(archive.sha256) ||
     !Number.isSafeInteger(archive.sizeBytes) || archive.sizeBytes < 1 ||
-    archive.sizeBytes > MAX_BUNDLE_BYTES || typeof archive.key !== "string") {
+    archive.sizeBytes > MAX_BUNDLE_BYTES || typeof archive.key !== "string" ||
+    !validKeySegment(job.frozenManifest.importId)) {
     throw new CompilerFailure("invalid_job");
   }
   const prefix = `shared-hosting/${job.accountId}/${job.serviceId}/`;
@@ -172,8 +195,7 @@ function verifyBuiltContent(built, job) {
 
 function isExactSignedGrant(grant, method) {
   return grant && grant.method === method && typeof grant.key === "string" &&
-    typeof grant.url === "string" && /^https:\/\//.test(grant.url) &&
-    typeof grant.expiresAt === "string";
+    exactHttpsUrl(grant.url) && Number.isSafeInteger(grantExpiresAt(grant));
 }
 
 function classifyFailure(error) {
@@ -194,7 +216,95 @@ function validSha256(value) {
   return typeof value === "string" && /^[a-f0-9]{64}$/i.test(value);
 }
 
-function validId(value) {
-  return typeof value === "string" && value.length > 0 && value.length <= 255 &&
-    !/[\x00-\x1f\x7f]/.test(value);
+function validKeySegment(value) {
+  return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$/.test(value);
+}
+
+function hasExactHeaders(value, expected) {
+  if (value === undefined) return Object.keys(expected).length === 0;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const actual = Object.keys(value).sort();
+  const keys = Object.keys(expected).sort();
+  return actual.length === keys.length &&
+    actual.every((key, index) => key === keys[index] && value[key] === expected[key]);
+}
+
+function exactHttpsUrl(value) {
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" && !url.username && !url.password && !url.hash;
+  } catch {
+    return false;
+  }
+}
+
+function grantExpiresAt(grant) {
+  const timestamp = Date.parse(grant?.expiresAt);
+  return Number.isSafeInteger(timestamp) ? timestamp : NaN;
+}
+
+function validNow(value) {
+  return Number.isSafeInteger(value) && value > 0;
+}
+
+async function exactRequest(fetchImpl, url, options, timeoutMs, failureCode, validateResponse) {
+  if (typeof fetchImpl !== "function" || !Number.isSafeInteger(timeoutMs) ||
+    timeoutMs < 1_000 || timeoutMs > 120_000) {
+    throw new CompilerFailure(failureCode);
+  }
+  const controller = new AbortController();
+  let timeout;
+  try {
+    const request = async () => {
+      const response = await fetchImpl(url, { ...options, signal: controller.signal });
+      return await validateResponse(response);
+    };
+    return await Promise.race([
+      request(),
+      new Promise((_, reject) => {
+        timeout = setTimeout(() => {
+          controller.abort();
+          reject(new CompilerFailure(failureCode));
+        }, timeoutMs);
+      }),
+    ]);
+  } catch (error) {
+    if (error instanceof CompilerFailure) throw error;
+    throw new CompilerFailure(failureCode);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function readExactBody(response, expectedSize) {
+  if (!response.body?.getReader) {
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    if (bytes.byteLength !== expectedSize) throw new CompilerFailure("input_size_mismatch");
+    return bytes;
+  }
+  const reader = response.body.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    while (true) {
+      const next = await reader.read();
+      if (next.done) break;
+      if (!(next.value instanceof Uint8Array)) throw new CompilerFailure("input_download_failed");
+      total += next.value.byteLength;
+      if (total > expectedSize || total > MAX_BUNDLE_BYTES) {
+        throw new CompilerFailure("input_size_mismatch");
+      }
+      chunks.push(next.value);
+    }
+  } finally {
+    reader.releaseLock?.();
+  }
+  if (total !== expectedSize) throw new CompilerFailure("input_size_mismatch");
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes;
 }

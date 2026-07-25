@@ -96,3 +96,148 @@ incorrect template, or missing primary/Mojang server artifact.
 The weekly workflow only validates and refreshes this lock, then opens a review
 PR if it changed. It does not compose a compiler worker, run installers, build
 or publish an image, upload content, or provision infrastructure.
+
+## HTTP worker and queue consumer
+
+`src/http-worker.mjs` provides `CompilerHttpWorker` and
+`createCompilerHttpServer`. The server exposes:
+
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /healthz` | unauthenticated liveness only; returns 200 even when compilation is fail-closed |
+| `GET /readyz` | returns 200 only after every reviewed dependency and identity adapter is configured |
+| `POST /v1/compiler-jobs` | authenticated synchronous queue-message consumption |
+
+The HTTP response acknowledges only after the worker has attempted the
+immutable upload and the authenticated callback. A 200 response with
+`{"status":"failed"}` means the control-plane failure callback was attempted;
+the control plane owns retry policy and must treat
+`compilerRequestId` as an idempotency key. A busy worker returns 429 before
+starting a sandbox. The default concurrency is one and is capped at sixteen.
+
+The endpoint accepts only this schema-versioned envelope (additional fields are
+rejected):
+
+```json
+{
+  "schemaVersion": 1,
+  "requestId": "exact-compiler-request-id",
+  "issuedAt": "2026-07-25T08:00:00.000Z",
+  "expiresAt": "2026-07-25T08:05:00.000Z",
+  "job": { "compilerRequestId": "exact-compiler-request-id", "...": "existing CompilerWorker job fields" },
+  "grants": {
+    "compilerRequestId": "exact-compiler-request-id",
+    "accountId": "…",
+    "serviceId": "…",
+    "deploymentId": "…",
+    "manifestSha256": "…",
+    "grants": ["the one exact GET grant and one immutable PUT grant"]
+  }
+}
+```
+
+`requestId`, `job.compilerRequestId`, and `grants.compilerRequestId` must be
+identical. The envelope lifetime is at most five minutes. Before any download
+or sandbox call, the worker reuses `validateCompilerJob` and `verifyGrantSet`
+to bind account, service, deployment, manifest SHA, input archive key, output
+key, GET/PUT methods, HTTPS grant URLs, unexpired grant timestamps, no input
+headers, and exactly `If-None-Match: *` on the output grant. It then reuses the
+bundle and reviewed-toolchain validation described above. Neither the envelope
+nor its grants can select callbacks, commands, Java paths, JVM arguments,
+Docker options, or sandbox settings.
+
+Object-grant GET/PUT operations are bounded to 30 seconds and stream the input
+with an exact byte cap; callbacks are bounded to 10 seconds. Timeouts are
+reported through the fixed `compiler_failed` callback path rather than exposing
+transport details.
+
+Completion and failure go only to the callback URL configured when the worker
+is composed. A completion includes the validated content and runtime
+descriptor; a failure includes only the fixed failure code. The URL is HTTPS in
+production, cannot contain credentials or a fragment, does not follow
+redirects, and is never read from a job. Callback receivers must authenticate
+and deduplicate the same `compilerRequestId`.
+
+## Service identity and replay protection
+
+Every queue delivery and callback uses the `ServiceIdentity` adapter boundary:
+
+```text
+verifyIncoming({ method, target, headers, body, transport })
+signOutgoing({ method, target, body })
+```
+
+Adapters must provide signed service identity plus timestamp and nonce replay
+checks. `HmacServiceIdentity` is supplied for a private HMAC key of at least
+32 bytes. It signs:
+
+```text
+METHOD \n PATH_AND_QUERY \n UNIX_MILLISECONDS \n NONCE \n SHA256(BODY)
+```
+
+in `Authorization: HMAC <key-id>:<base64url-signature>`, with
+`X-Xmcl-Timestamp` and `X-Xmcl-Nonce`. It accepts timestamps within 60 seconds
+and rejects reused nonces. Its in-memory nonce cache is **local test/single
+process only**. A production HMAC deployment must inject a durable shared nonce
+store (for example, an atomic control-plane/Redis store) marked
+`durable: true`; each callback receiver must enforce the same policy.
+
+JWT and mTLS deployments use the same adapter boundary. A JWT adapter must bind
+method, target, body digest, issuance time, expiry, and unique token ID. An
+mTLS adapter must validate the peer workload identity through trusted transport
+state and still enforce a signed/timestamped nonce; an outbound mTLS adapter
+must use a trusted client-certificate transport. Do not terminate identity
+checks in untrusted job code or accept a browser/node/object-store credential.
+
+## Trusted composition and sandbox boundary
+
+`CompilerHttpWorker` remains unavailable unless code owned by the deployment
+injects all of the following:
+
+1. a valid `ReviewedToolchainCatalog`;
+2. a verified JRE registry that returns a matching `verified`, read-only root;
+3. an isolated `sandboxAdapter` with the required ephemeral/non-root/read-only,
+   no-secrets/no-Docker, bounded-resource, approved-artifact-only capabilities;
+4. `StrictArtifactDownloader` (or the explicitly test-only fake path);
+5. replay-protected inbound and callback service-identity adapters; and
+6. an immutable configured callback URL and authenticated callback transport.
+
+The adapter receives only the compiler-owned assembly plan, exact reviewed
+artifact bytes, and exact JRE root token. It has one narrow
+`assemble(request)` operation. This package does not spawn a shell, execute a
+bundle file, select a JVM, invoke Docker, or load an adapter module from an
+environment variable. Never make a job field into adapter configuration.
+
+No approved production sandbox, read-only JRE roots, or installer execution
+adapter is included in this repository. The included container consequently
+starts liveness only and returns 503 from `/readyz` and job delivery until a
+trusted deployment image composes the reviewed adapters in code. This is
+intentional: Forge, Fabric, NeoForge, and Quilt installers are **not claimed
+production-ready** here.
+
+## Container, environment, and image publication
+
+The image runs `src/worker-server.mjs` as UID/GID `10001`, exposes port 8080,
+and has a liveness health check against `/healthz`.
+
+| Environment variable | Default | Allowed values | Meaning |
+| --- | --- | --- | --- |
+| `HOST` | `0.0.0.0` | `0.0.0.0`, `127.0.0.1`, `::` | HTTP bind address |
+| `PORT` | `8080` | `1`–`65535` | HTTP bind port |
+| `NODE_ENV` | `production` | platform value | Node runtime mode; it does not enable compilation |
+
+There are deliberately no environment variables for catalog URLs, installer
+commands, Java paths, Docker options, sandbox commands, callback URLs, or
+identity secrets. A trusted deployment integration supplies reviewed objects
+and secret-backed identity adapters without making them user-controlled.
+
+Run the container with a read-only root filesystem, no host mounts or Docker
+socket, no added capabilities, an ephemeral writable workspace owned by the
+non-root UID if the reviewed sandbox needs one, and CPU/memory/PID/network
+limits. A default image being live is not evidence that it is ready to compile.
+
+`.github/workflows/publish-image.yml` validates tests, publishes only a unique
+`sha-<full-git-sha>` GHCR tag, and attaches BuildKit provenance and SBOM
+attestations. Tags are convenience references; deploy the resulting immutable
+`ghcr.io/Voxelum/xmcl-shared-minecraft-compiler@sha256:...` digest after
+verifying the provenance and SBOM. The workflow never publishes `latest`.
