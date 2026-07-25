@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { CompilerFailure, MAX_BUNDLE_BYTES, validateBundle } from "./bundle.mjs";
+import { ReviewedRuntimeBuilder, validateImmutableContent } from "./reviewed-builder.mjs";
 
 const failureCodes = new Set([
   "unsupported_compatibility",
@@ -60,6 +61,30 @@ export class FailClosedRuntimeBuilder {
   async build() {
     throw new CompilerFailure("compiler_unavailable");
   }
+}
+
+/**
+ * Production code must inject all reviewed dependencies explicitly. Omitting
+ * any one of them leaves ReviewedRuntimeBuilder fail-closed at build time.
+ */
+export function createReviewedCompilerWorker({
+  controlPlane,
+  fetchImpl = fetch,
+  toolchainCatalog,
+  verifiedJres,
+  sandboxRunner,
+  artifactDownloader,
+} = {}) {
+  return new CompilerWorker({
+    controlPlane,
+    fetchImpl,
+    builder: new ReviewedRuntimeBuilder({
+      toolchainCatalog,
+      verifiedJres,
+      sandboxRunner,
+      artifactDownloader,
+    }),
+  });
 }
 
 export function verifyGrantSet(grants, job) {
@@ -142,6 +167,7 @@ function verifyBuiltContent(built, job) {
     built.descriptor.launch.arguments.length !== 0) {
     throw new CompilerFailure("invalid_builder_output");
   }
+  validateImmutableContent(built);
 }
 
 function isExactSignedGrant(grant, method) {

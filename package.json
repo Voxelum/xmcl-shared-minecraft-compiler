@@ -8,6 +8,6 @@
   },
   "scripts": {
     "test": "node --test",
-    "check": "node --check src/bundle.mjs && node --check src/compiler.mjs"
+    "check": "node --check src/bundle.mjs && node --check src/reviewed-builder.mjs && node --check src/compiler.mjs"
   }
 }

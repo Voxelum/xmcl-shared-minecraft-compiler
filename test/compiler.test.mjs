@@ -3,6 +3,13 @@ import { createHash } from "node:crypto";
 import test from "node:test";
 import { validateBundle } from "../src/bundle.mjs";
 import { CompilerWorker, verifyGrantSet } from "../src/compiler.mjs";
+import {
+  DeterministicFakeArtifactDownloader,
+  DeterministicFakeJreRegistry,
+  DeterministicFakeSandboxRunner,
+  ReviewedRuntimeBuilder,
+  StrictArtifactDownloader,
+} from "../src/reviewed-builder.mjs";
 
 function sha(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
@@ -175,6 +182,196 @@ test("the unavailable builder reports a durable failure and never executes the b
     code: "compiler_unavailable",
   }]);
 });
+
+test("reviewed builder uploads only the immutable output grant and publishes validated content", async () => {
+  const { archive, job, grants } = fixture();
+  const artifact = Uint8Array.from([4, 5, 6]);
+  const coordinate = "net.fabricmc:fabric-loader:0.16.10:server";
+  const builder = reviewedBuilder({
+    artifact,
+    coordinate,
+    fail: false,
+  });
+  const requests = [];
+  const publications = [];
+  const worker = new CompilerWorker({
+    controlPlane: {
+      getGrants: async () => grants,
+      publish: async (publication) => publications.push(publication),
+      failed: async () => assert.fail("a reviewed successful build must not fail"),
+    },
+    builder,
+    fetchImpl: async (url, options) => {
+      requests.push({ url, options });
+      if (url === grants.grants[0].url) {
+        return new Response(archive, {
+          headers: { "content-length": String(archive.length) },
+        });
+      }
+      if (url === grants.grants[1].url) return new Response(null, { status: 200 });
+      assert.fail(`unexpected URL ${url}`);
+    },
+  });
+  const result = await worker.run(job);
+  assert.deepEqual(result, { status: "published", deploymentId: job.deploymentId });
+  assert.deepEqual(requests.map((request) => request.options.method), ["GET", "PUT"]);
+  assert.deepEqual(requests[1].options.headers, { "if-none-match": "*" });
+  assert.equal(publications.length, 1);
+  assert.equal(publications[0].content.key, job.expectedContentKey);
+  assert.ok(publications[0].content.entries.some((entry) => entry.path === ".xmcl/runtime.json"));
+  assert.ok(publications[0].content.entries.some((entry) => entry.path === ".xmcl/launch.sh"));
+});
+
+test("an installer failure never uploads or publishes content", async () => {
+  const { archive, job, grants } = fixture();
+  const requests = [];
+  const publications = [];
+  const failures = [];
+  const worker = new CompilerWorker({
+    controlPlane: {
+      getGrants: async () => grants,
+      publish: async (publication) => publications.push(publication),
+      failed: async (failure) => failures.push(failure),
+    },
+    builder: reviewedBuilder({
+      artifact: Uint8Array.from([4, 5, 6]),
+      coordinate: "net.fabricmc:fabric-loader:0.16.10:server",
+      fail: true,
+    }),
+    fetchImpl: async (url, options) => {
+      requests.push({ url, options });
+      assert.equal(url, grants.grants[0].url);
+      return new Response(archive, {
+        headers: { "content-length": String(archive.length) },
+      });
+    },
+  });
+  const result = await worker.run(job);
+  assert.deepEqual(result, { status: "failed", code: "compiler_failed" });
+  assert.deepEqual(requests.map((request) => request.options.method), ["GET"]);
+  assert.deepEqual(publications, []);
+  assert.deepEqual(failures, [{
+    deploymentId: job.deploymentId,
+    manifestSha256: job.manifestSha256,
+    code: "compiler_failed",
+  }]);
+});
+
+test("reviewed artifact validation failures never upload or publish content", async () => {
+  const cases = [
+    {
+      name: "wrong host",
+      transform: (artifact) => ({ ...artifact, url: "https://unreviewed.example/server.jar" }),
+      fetchImpl: async () => assert.fail("wrong hosts must reject before download"),
+    },
+    {
+      name: "redirect",
+      transform: (artifact) => artifact,
+      fetchImpl: async (artifact) => ({
+        status: 200,
+        redirected: true,
+        headers: new Headers({ "content-length": String(artifact.sizeBytes) }),
+      }),
+    },
+    {
+      name: "oversize",
+      transform: (artifact) => artifact,
+      fetchImpl: async (artifact) => new Response(bytes("oversize"), {
+        status: 200,
+        headers: { "content-length": String(artifact.sizeBytes + 1) },
+      }),
+    },
+    {
+      name: "hash mismatch",
+      transform: (artifact) => artifact,
+      fetchImpl: async (artifact) => new Response(Uint8Array.from([0, 0, 0]), {
+        status: 200,
+        headers: { "content-length": String(artifact.sizeBytes) },
+      }),
+    },
+  ];
+  for (const scenario of cases) {
+    const { archive, job, grants } = fixture();
+    const artifact = Uint8Array.from([4, 5, 6]);
+    const strict = new StrictArtifactDownloader({
+      fetchImpl: () => scenario.fetchImpl({
+        coordinate: "net.fabricmc:fabric-loader:0.16.10:server",
+        url: "https://toolchain.example/fabric-server.jar",
+        sha256: sha(artifact),
+        sizeBytes: artifact.byteLength,
+      }),
+    });
+    const downloader = {
+      download: (reviewedArtifact, options) => strict.download(
+        scenario.transform(reviewedArtifact),
+        options,
+      ),
+    };
+    const requests = [];
+    const publications = [];
+    const worker = new CompilerWorker({
+      controlPlane: {
+        getGrants: async () => grants,
+        publish: async (publication) => publications.push(publication),
+        failed: async () => undefined,
+      },
+      builder: reviewedBuilder({
+        artifact,
+        coordinate: "net.fabricmc:fabric-loader:0.16.10:server",
+        fail: false,
+        artifactDownloader: downloader,
+      }),
+      fetchImpl: async (url, options) => {
+        requests.push({ url, options });
+        assert.equal(url, grants.grants[0].url, `${scenario.name} must not use the output grant`);
+        return new Response(archive, {
+          headers: { "content-length": String(archive.length) },
+        });
+      },
+    });
+    const result = await worker.run(job);
+    assert.deepEqual(result, { status: "failed", code: "compiler_failed" }, scenario.name);
+    assert.deepEqual(requests.map((request) => request.options.method), ["GET"], scenario.name);
+    assert.deepEqual(publications, [], scenario.name);
+  }
+});
+
+function reviewedBuilder({ artifact, coordinate, fail, artifactDownloader }) {
+  const jre = Uint8Array.from([7, 8, 9]);
+  const jreDefinition = {
+    id: "jre-java-runtime-delta-21",
+    sha256: sha(jre),
+    component: "java-runtime-delta",
+    major: 21,
+    runtimeCatalogRevision: "a".repeat(64),
+  };
+  return new ReviewedRuntimeBuilder({
+    toolchainCatalog: {
+      schemaVersion: 1,
+      catalogVersion: "test-review-1",
+      runtimeCatalogRevision: "a".repeat(64),
+      approvedArtifactHosts: ["toolchain.example"],
+      toolchains: [{
+        minecraftVersion: "1.21.1",
+        loader: { kind: "fabric", version: "0.16.10" },
+        java: { component: "java-runtime-delta", major: 21 },
+        jre: jreDefinition,
+        artifacts: [{
+          role: "primary",
+          coordinate,
+          url: "https://toolchain.example/fabric-server.jar",
+          sha256: sha(artifact),
+          sizeBytes: artifact.byteLength,
+        }],
+        launchTemplate: "fabric-server-jar-v1",
+      }],
+    },
+    verifiedJres: new DeterministicFakeJreRegistry([jreDefinition]),
+    sandboxRunner: new DeterministicFakeSandboxRunner({ fail }),
+    artifactDownloader: artifactDownloader ??
+      new DeterministicFakeArtifactDownloader(new Map([[coordinate, artifact]])),
+  });
+}
 
 function u16(out, value) {
   out.push(value & 0xff, (value >>> 8) & 0xff);
