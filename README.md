@@ -114,6 +114,12 @@ immutable upload and the authenticated callback. A 200 response with
 the control plane owns retry policy and must treat
 `compilerRequestId` as an idempotency key. A busy worker returns 429 before
 starting a sandbox. The default concurrency is one and is capped at sixteen.
+Once the immutable upload succeeds and published-callback delivery begins, any
+callback timeout, transport error, or non-2xx response returns
+`published_callback_uncertain` instead. That result includes the exact
+publication payload for an authenticated control plane to retry as the same
+published event; the worker never sends a contradictory failed callback after
+publication has begun.
 
 The endpoint accepts only this schema-versioned envelope (additional fields are
 rejected):
@@ -148,8 +154,9 @@ Docker options, or sandbox settings.
 
 Object-grant GET/PUT operations are bounded to 30 seconds and stream the input
 with an exact byte cap; callbacks are bounded to 10 seconds. Timeouts are
-reported through the fixed `compiler_failed` callback path rather than exposing
-transport details.
+reported through the fixed `compiler_failed` callback path only before
+publication begins. Published-callback delivery is instead reported as
+`published_callback_uncertain` so it can be reconciled safely.
 
 Completion and failure go only to the callback URL configured when the worker
 is composed. A completion includes the validated content and runtime
@@ -169,7 +176,7 @@ signOutgoing({ method, target, body })
 
 Adapters must provide signed service identity plus timestamp and nonce replay
 checks. `HmacServiceIdentity` is supplied for a private HMAC key of at least
-32 bytes. It signs:
+32 bytes for local/integration testing only. It signs:
 
 ```text
 METHOD \n PATH_AND_QUERY \n UNIX_MILLISECONDS \n NONCE \n SHA256(BODY)
@@ -178,9 +185,11 @@ METHOD \n PATH_AND_QUERY \n UNIX_MILLISECONDS \n NONCE \n SHA256(BODY)
 in `Authorization: HMAC <key-id>:<base64url-signature>`, with
 `X-Xmcl-Timestamp` and `X-Xmcl-Nonce`. It accepts timestamps within 60 seconds
 and rejects reused nonces. Its in-memory nonce cache is **local test/single
-process only**. A production HMAC deployment must inject a durable shared nonce
-store (for example, an atomic control-plane/Redis store) marked
-`durable: true`; each callback receiver must enforce the same policy.
+process only**, cannot be marked durable, and `HmacServiceIdentity` is always
+ineligible for production worker composition. A production HMAC deployment must
+implement a distinct `ServiceIdentity` adapter backed by an atomic shared
+replay store (for example, control-plane/Redis conditional insert); each
+callback receiver must enforce the same policy.
 
 JWT and mTLS deployments use the same adapter boundary. A JWT adapter must bind
 method, target, body digest, issuance time, expiry, and unique token ID. An

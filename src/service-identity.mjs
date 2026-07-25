@@ -38,8 +38,9 @@ export class ServiceIdentity {
 }
 
 /**
- * HMAC workload identity for deployments that do not terminate mTLS or JWT in
- * a trusted sidecar. A durable shared nonce store is required in production.
+ * HMAC identity for local and integration testing. It is deliberately never a
+ * production-ready replay identity: production must provide a distinct
+ * ServiceIdentity adapter backed by an atomic shared replay store.
  */
 export class HmacServiceIdentity {
   constructor({
@@ -61,7 +62,12 @@ export class HmacServiceIdentity {
     this.nonceStore = nonceStore;
     this.clock = clock;
     this.maxAgeMs = maxAgeMs;
-    this.replayProtected = nonceStore.durable === true;
+    Object.defineProperty(this, "replayProtected", {
+      value: false,
+      enumerable: true,
+      writable: false,
+      configurable: false,
+    });
   }
 
   async verifyIncoming({ method, target, headers, body } = {}) {
@@ -104,16 +110,18 @@ export class HmacServiceIdentity {
 
 /**
  * In-memory replay protection is suitable only for a single local process and
- * tests. Production HMAC deployments must inject a durable shared nonce store.
+ * tests. It can never be marked durable.
  */
 export class InMemoryReplayCache {
-  constructor({ maxEntries = 100_000, durable = false } = {}) {
-    if (!Number.isSafeInteger(maxEntries) || maxEntries < 1 || maxEntries > 1_000_000 ||
-      typeof durable !== "boolean") {
+  constructor(options = {}) {
+    if (!plainObject(options) || Object.keys(options).some((key) => key !== "maxEntries")) {
+      throw new TypeError("invalid replay cache configuration");
+    }
+    const { maxEntries = 100_000 } = options;
+    if (!Number.isSafeInteger(maxEntries) || maxEntries < 1 || maxEntries > 1_000_000) {
       throw new TypeError("invalid replay cache configuration");
     }
     this.maxEntries = maxEntries;
-    this.durable = durable;
     this.entries = new Map();
   }
 
@@ -191,4 +199,8 @@ function plainStringRecord(value) {
     Object.entries(value).every(([key, item]) =>
       /^[a-z0-9-]+$/.test(key) && typeof item === "string" && !/[\r\n]/.test(item),
     );
+}
+
+function plainObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }

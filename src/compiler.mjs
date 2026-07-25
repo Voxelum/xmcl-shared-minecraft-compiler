@@ -31,6 +31,8 @@ export class CompilerWorker {
   }
 
   async run(job) {
+    let publication;
+    let publicationStarted = false;
     try {
       validateCompilerJob(job);
       const grants = await this.controlPlane.getGrants(job.deploymentId);
@@ -46,14 +48,25 @@ export class CompilerWorker {
       });
       verifyBuiltContent(built, job);
       await uploadExact(this.fetch, output, built.archive, { timeoutMs: this.requestTimeoutMs });
-      await this.controlPlane.publish({
+      publication = {
         deploymentId: job.deploymentId,
         manifestSha256: job.manifestSha256,
         content: built.content,
         descriptor: built.descriptor,
-      });
+      };
+      publicationStarted = true;
+      await this.controlPlane.publish(publication);
       return { status: "published", deploymentId: job.deploymentId };
     } catch (error) {
+      if (publicationStarted) {
+        return {
+          status: "published_callback_uncertain",
+          deploymentId: job.deploymentId,
+          manifestSha256: job.manifestSha256,
+          content: publication.content,
+          descriptor: publication.descriptor,
+        };
+      }
       const code = classifyFailure(error);
       await this.controlPlane.failed({
         deploymentId: job?.deploymentId,

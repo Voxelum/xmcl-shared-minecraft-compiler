@@ -6,6 +6,7 @@ import {
   DeterministicFakeArtifactDownloader,
   DeterministicFakeJreRegistry,
   DeterministicFakeSandboxRunner,
+  StrictArtifactDownloader,
 } from "../src/reviewed-builder.mjs";
 import { CompilerHttpWorker, createCompilerHttpServer } from "../src/http-worker.mjs";
 import { HmacServiceIdentity, InMemoryReplayCache } from "../src/service-identity.mjs";
@@ -165,6 +166,86 @@ test("HMAC identity binds the exact body and rejects expired timestamps", async 
     headers,
     body,
   }), /request_identity_rejected/);
+});
+
+test("in-memory HMAC replay state cannot compose a production-ready worker", () => {
+  const fixture = compilerFixture();
+  const secret = "local-integration-test-secret-must-be-32-bytes";
+  assert.throws(
+    () => new InMemoryReplayCache({ durable: true }),
+    /invalid replay cache configuration/,
+  );
+  const localHmac = identity("control-plane", secret);
+  assert.equal(localHmac.replayProtected, false);
+  assert.throws(() => {
+    localHmac.replayProtected = true;
+  }, /read only/);
+  const worker = new CompilerHttpWorker({
+    ...reviewedDependencies(fixture, new DeterministicFakeSandboxRunner()),
+    artifactDownloader: new StrictArtifactDownloader({
+      fetchImpl: async () => new Response("not used"),
+    }),
+    requestAuthenticator: localHmac,
+    callback: {
+      url: "https://control-plane.example/compiler-callback",
+      authenticator: identity("callback", secret),
+    },
+  });
+  assert.equal(worker.health().ready, false);
+});
+
+test("a published callback with a lost response never emits a failed callback", async (t) => {
+  const fixture = compilerFixture();
+  const secret = "local-integration-test-secret-must-be-32-bytes";
+  const callbackEvents = [];
+  const callbackVerifier = identity("callback", secret);
+  const callbackServer = createServer(async (request, response) => {
+    const body = await readBody(request);
+    await callbackVerifier.verifyIncoming({
+      method: request.method,
+      target: request.url,
+      headers: request.headers,
+      body,
+    });
+    callbackEvents.push(JSON.parse(new TextDecoder().decode(body)));
+    response.writeHead(204).end();
+  });
+  const callbackAddress = await listen(callbackServer);
+  t.after(() => close(callbackServer));
+
+  const sandboxAdapter = new DeterministicFakeSandboxRunner();
+  const worker = new CompilerHttpWorker({
+    ...reviewedDependencies(fixture, sandboxAdapter),
+    requestAuthenticator: identity("control-plane", secret),
+    callback: {
+      url: `http://127.0.0.1:${callbackAddress.port}/compiler-callback`,
+      authenticator: identity("callback", secret),
+      fetchImpl: async (url, options) => {
+        await fetch(url, options);
+        throw new Error("simulated response loss after callback acceptance");
+      },
+    },
+    fetchImpl: objectStore(fixture),
+    allowInsecureForTests: true,
+  });
+  const server = createCompilerHttpServer({ worker });
+  const address = await listen(server);
+  t.after(() => close(server));
+
+  const response = await postSigned({
+    url: `http://127.0.0.1:${address.port}/v1/compiler-jobs`,
+    signer: identity("control-plane", secret),
+    envelope: messageFor(fixture),
+  });
+  assert.equal(response.status, 200);
+  const result = await response.json();
+  assert.equal(result.status, "published_callback_uncertain");
+  assert.equal(result.deploymentId, fixture.job.deploymentId);
+  assert.equal(result.manifestSha256, fixture.job.manifestSha256);
+  assert.equal(result.content.key, fixture.job.expectedContentKey);
+  assert.equal(result.descriptor.launch.path, ".xmcl/launch.sh");
+  assert.equal(sandboxAdapter.calls.length, 1);
+  assert.deepEqual(callbackEvents.map((event) => event.status), ["published"]);
 });
 
 function reviewedDependencies(fixture, sandboxAdapter) {
