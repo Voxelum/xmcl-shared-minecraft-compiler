@@ -39,8 +39,9 @@ function zip(entries) {
 function fixture() {
   const catalog = "a".repeat(64);
   const manifestSha256 = "b".repeat(64);
+  const mod = { path: "instance/mods/example.jar", bytes: Uint8Array.from([1, 2, 3]) };
   const files = [
-    { path: "instance/mods/example.jar", bytes: Uint8Array.from([1, 2, 3]) },
+    mod,
     { path: "resolved/loader.json", bytes: json({
       minecraftVersion: "1.21.1",
       loader: { kind: "fabric", version: "0.16.10" },
@@ -48,7 +49,15 @@ function fixture() {
       runtimeCatalog: { sha256: catalog },
     }) },
     { path: "resolved/mods.json", bytes: json([]) },
-    { path: "resolved/server-libraries.json", bytes: json([]) },
+    { path: "resolved/artifacts.json", bytes: json({
+      schemaVersion: 1,
+      artifacts: [{
+        intent: "mod",
+        path: mod.path,
+        sha256: sha(mod.bytes),
+        sizeBytes: mod.bytes.length,
+      }],
+    }) },
     { path: "resolved/version.json", bytes: json({
       minecraftVersion: "1.21.1",
       javaVersion: { component: "java-runtime-delta", majorVersion: 21 },

@@ -5,6 +5,11 @@ deployment identity, obtains exactly one compiler input GET grant and one
 immutable content PUT grant from the control plane, then revalidates the
 `.xmcl-server-bundle` before any builder can see it.
 
+The bundle is a content-and-metadata handoff from an already-working modded
+client instance, not a local dedicated-server export. It carries selected
+instance artifacts and their hashes plus loader/version metadata; a reviewed
+builder must assemble the dedicated-server runtime independently.
+
 `FailClosedRuntimeBuilder` is intentional: it always reports
 `compiler_unavailable`. Production must not enable a builder until reviewed
 loader/server toolchains, approved artifact origins, constrained egress,

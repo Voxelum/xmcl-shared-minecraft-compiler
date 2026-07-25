@@ -9,7 +9,7 @@ const decoder = new TextDecoder("utf-8", { fatal: true });
 const requiredResolvedFiles = new Set([
   "resolved/version.json",
   "resolved/loader.json",
-  "resolved/server-libraries.json",
+  "resolved/artifacts.json",
   "resolved/mods.json",
 ]);
 
@@ -124,6 +124,7 @@ function verifyResolvedMetadata(entries, manifest) {
   try {
     const loader = JSON.parse(decoder.decode(entries.get("resolved/loader.json").bytes));
     const version = JSON.parse(decoder.decode(entries.get("resolved/version.json").bytes));
+    const artifacts = JSON.parse(decoder.decode(entries.get("resolved/artifacts.json").bytes));
     if (
       loader.minecraftVersion !== manifest.minecraftVersion ||
       loader.loader?.kind !== manifest.loader.kind ||
@@ -133,11 +134,44 @@ function verifyResolvedMetadata(entries, manifest) {
       loader.runtimeCatalog?.sha256 !== manifest.runtimeCatalog.sha256 ||
       version.minecraftVersion !== manifest.minecraftVersion ||
       version.javaVersion?.component !== manifest.javaRequirement.component ||
-      version.javaVersion?.majorVersion !== manifest.javaRequirement.major
+      version.javaVersion?.majorVersion !== manifest.javaRequirement.major ||
+      !validArtifactMetadata(artifacts, manifest)
     ) throw new Error();
   } catch {
     throw new CompilerFailure("resolved_metadata_mismatch");
   }
+}
+
+function validArtifactMetadata(value, manifest) {
+  if (!plainObject(value) || value.schemaVersion !== 1 ||
+    Object.keys(value).some((key) => key !== "schemaVersion" && key !== "artifacts") ||
+    !Array.isArray(value.artifacts)
+  ) return false;
+  const expected = manifest.files.filter((file) => file.path.startsWith("instance/"));
+  return expected.length === value.artifacts.length && expected.every((file, index) => {
+    const artifact = value.artifacts[index];
+    return plainObject(artifact) &&
+      Object.keys(artifact).every((key) =>
+        ["intent", "path", "sha256", "sizeBytes"].includes(key)
+      ) &&
+      artifact.path === file.path &&
+      artifact.sha256 === file.sha256 &&
+      artifact.sizeBytes === file.sizeBytes &&
+      artifact.intent === artifactIntent(file.path);
+  });
+}
+
+function artifactIntent(path) {
+  if (path.startsWith("instance/mods/")) return "mod";
+  if (path.startsWith("instance/config/") || path.startsWith("instance/defaultconfigs/")) return "config";
+  if (path.startsWith("instance/kubejs/")) return "kubejs";
+  if (path.startsWith("instance/scripts/")) return "script";
+  if (path.startsWith("instance/datapacks/")) return "datapack";
+  if (path.startsWith("instance/global_packs/")) return "global-pack";
+  if (path.startsWith("instance/openloader/")) return "openloader";
+  if (path.startsWith("instance/paxi/")) return "paxi";
+  if (path.startsWith("instance/resourcepacks/")) return "resourcepack";
+  return "data";
 }
 
 function readZip(archive) {
@@ -216,14 +250,14 @@ function readZip(archive) {
 function allowedPath(path) {
   if (!safeZipPath(path) || /(?:^|\/)(?:server|start)\.(?:sh|bat|cmd)$/i.test(path)) return false;
   return path === "resolved/version.json" || path === "resolved/loader.json" ||
-    path === "resolved/server-libraries.json" || path === "resolved/mods.json" ||
+    path === "resolved/artifacts.json" || path === "resolved/mods.json" ||
     path === "instance/server.properties" || path === "instance/pack.toml" ||
     path === "instance/pack.mcmeta" || path === "instance/server-icon.png" ||
     path === "instance/eula.txt" || [
       "instance/mods/", "instance/config/", "instance/defaultconfigs/",
       "instance/kubejs/", "instance/scripts/", "instance/datapacks/",
       "instance/global_packs/", "instance/openloader/", "instance/paxi/",
-      "instance/resourcepacks/", "resolved/libraries/",
+      "instance/resourcepacks/",
     ].some((prefix) => path.startsWith(prefix));
 }
 
