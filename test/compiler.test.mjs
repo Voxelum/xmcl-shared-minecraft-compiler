@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
+import { validateBundle } from "../src/bundle.mjs";
 import { CompilerWorker, verifyGrantSet } from "../src/compiler.mjs";
 
 function sha(bytes) {
@@ -36,7 +37,7 @@ function zip(entries) {
   return Uint8Array.from(out);
 }
 
-function fixture() {
+function fixture({ includeEula = false } = {}) {
   const catalog = "a".repeat(64);
   const manifestSha256 = "b".repeat(64);
   const mod = { path: "instance/mods/example.jar", bytes: Uint8Array.from([1, 2, 3]) };
@@ -63,6 +64,9 @@ function fixture() {
       javaVersion: { component: "java-runtime-delta", majorVersion: 21 },
     }) },
   ];
+  if (includeEula) {
+    files.push({ path: "instance/eula.txt", bytes: json("eula=true") });
+  }
   const manifest = {
     schemaVersion: 1,
     instanceName: "pack",
@@ -134,6 +138,15 @@ test("grant verification rejects substituted node or output grants", () => {
     /invalid_grants/,
   );
 });
+
+test("compiler rejects a launcher-provided EULA file", async () => {
+  const { archive, job } = fixture({ includeEula: true });
+  await assert.rejects(
+    () => validateBundle(archive, job.frozenManifest),
+    /invalid_bundle_manifest|bundle_hash_or_path_mismatch/,
+  );
+});
+
 
 test("the unavailable builder reports a durable failure and never executes the bundle launcher", async () => {
   const { archive, job, grants } = fixture();

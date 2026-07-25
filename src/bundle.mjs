@@ -253,7 +253,7 @@ function allowedPath(path) {
     path === "resolved/artifacts.json" || path === "resolved/mods.json" ||
     path === "instance/server.properties" || path === "instance/pack.toml" ||
     path === "instance/pack.mcmeta" || path === "instance/server-icon.png" ||
-    path === "instance/eula.txt" || [
+    [
       "instance/mods/", "instance/config/", "instance/defaultconfigs/",
       "instance/kubejs/", "instance/scripts/", "instance/datapacks/",
       "instance/global_packs/", "instance/openloader/", "instance/paxi/",
