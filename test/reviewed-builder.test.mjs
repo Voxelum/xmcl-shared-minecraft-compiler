@@ -127,12 +127,12 @@ function buildInput(fixture, localFiles) {
 
 test("reviewed catalog resolves only exact Forge, Fabric, NeoForge, and Quilt fixtures", async () => {
   const fixtures = [
-    toolchainFixture({ minecraftVersion: "1.12.2", kind: "forge", version: "14.23.5", component: "java-runtime-legacy", major: 8 }),
+    toolchainFixture({ minecraftVersion: "1.12.2", kind: "forge", version: "14.23.5", component: "jre-legacy", major: 8 }),
     toolchainFixture({ minecraftVersion: "1.16.5", kind: "forge", version: "36.2.39", component: "java-runtime-alpha", major: 16 }),
     toolchainFixture({ minecraftVersion: "1.16.5", kind: "fabric", version: "0.11.7", component: "java-runtime-alpha", major: 16 }),
     toolchainFixture({ minecraftVersion: "1.18.2", kind: "fabric", version: "0.14.22", component: "java-runtime-beta", major: 17 }),
     toolchainFixture({ minecraftVersion: "1.21.1", kind: "neoforge", version: "21.1.115", component: "java-runtime-delta", major: 21 }),
-    toolchainFixture({ minecraftVersion: "1.21.8", kind: "quilt", version: "0.28.0", component: "java-runtime-current", major: 25 }),
+    toolchainFixture({ minecraftVersion: "1.21.8", kind: "quilt", version: "0.28.0", component: "java-runtime-epsilon", major: 25 }),
   ];
 
   for (const fixture of fixtures) {
