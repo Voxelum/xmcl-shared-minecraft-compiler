@@ -69,3 +69,30 @@ or completed runtime worlds.
 
 Run `npm test` and `npm run check` locally. This package intentionally does not
 claim live loader compilation until those external reviewed adapters exist.
+
+## Reviewed toolchain catalog
+
+`toolchain-catalog.lock.json` is generated only from the reviewed
+`xmcl-shared-minecraft-runtime/runtime-catalog.lock.json` and official loader
+metadata. The catalog revision is the SHA-256 of its canonical JSON projection
+with `catalogRevision` zeroed, avoiding a self-referential digest while keeping
+the tracked lock deterministic and reviewable.
+
+```text
+node scripts/update_toolchain_catalog.mjs \
+  --runtime-catalog-lock ..\xmcl-shared-minecraft-runtime\runtime-catalog.lock.json
+node scripts/validate_toolchain_catalog.mjs \
+  --runtime-catalog-lock ..\xmcl-shared-minecraft-runtime\runtime-catalog.lock.json
+```
+
+Generation permits only the explicit compatibility candidates in
+`src/toolchain-catalog.mjs`. It downloads official metadata and the exact
+approved artifacts with HTTPS-only, no-redirect, bounded-size requests; it
+verifies published SHA-1 checksums where available, then records each artifact's
+computed SHA-256 and byte size. Validation rejects an unbound runtime revision,
+unselected Java component/major, unsupported URL/host/path, duplicate tuple,
+incorrect template, or missing primary/Mojang server artifact.
+
+The weekly workflow only validates and refreshes this lock, then opens a review
+PR if it changed. It does not compose a compiler worker, run installers, build
+or publish an image, upload content, or provision infrastructure.

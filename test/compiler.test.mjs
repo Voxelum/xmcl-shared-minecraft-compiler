@@ -209,7 +209,7 @@ test("the unavailable builder reports a durable failure and never executes the b
 test("reviewed builder uploads only the immutable output grant and publishes validated content", async () => {
   const { archive, job, grants } = fixture();
   const artifact = Uint8Array.from([4, 5, 6]);
-  const coordinate = "net.fabricmc:fabric-loader:0.16.10:server";
+  const coordinate = "net.fabricmc:fabric-loader:0.16.10";
   const builder = reviewedBuilder({
     artifact,
     coordinate,
@@ -258,7 +258,7 @@ test("an installer failure never uploads or publishes content", async () => {
     },
     builder: reviewedBuilder({
       artifact: Uint8Array.from([4, 5, 6]),
-      coordinate: "net.fabricmc:fabric-loader:0.16.10:server",
+      coordinate: "net.fabricmc:fabric-loader:0.16.10",
       fail: true,
     }),
     fetchImpl: async (url, options) => {
@@ -318,7 +318,7 @@ test("reviewed artifact validation failures never upload or publish content", as
     const artifact = Uint8Array.from([4, 5, 6]);
     const strict = new StrictArtifactDownloader({
       fetchImpl: () => scenario.fetchImpl({
-        coordinate: "net.fabricmc:fabric-loader:0.16.10:server",
+        coordinate: "net.fabricmc:fabric-loader:0.16.10",
         url: "https://toolchain.example/fabric-server.jar",
         sha256: sha(artifact),
         sizeBytes: artifact.byteLength,
@@ -340,7 +340,7 @@ test("reviewed artifact validation failures never upload or publish content", as
       },
       builder: reviewedBuilder({
         artifact,
-        coordinate: "net.fabricmc:fabric-loader:0.16.10:server",
+        coordinate: "net.fabricmc:fabric-loader:0.16.10",
         fail: false,
         artifactDownloader: downloader,
       }),

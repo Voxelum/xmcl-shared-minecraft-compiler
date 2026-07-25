@@ -1,0 +1,65 @@
+name: Update reviewed toolchain catalog
+
+on:
+  schedule:
+    - cron: "23 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: update-reviewed-toolchain-catalog
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out compiler catalog
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Check out reviewed runtime lock
+        uses: actions/checkout@v4
+        with:
+          repository: Voxelum/xmcl-shared-minecraft-runtime
+          path: reviewed-runtime
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Validate reviewed runtime lock
+        run: >-
+          python3 reviewed-runtime/scripts/validate_runtime_catalog.py
+          --lock reviewed-runtime/runtime-catalog.lock.json
+
+      - name: Refresh reviewed catalog candidates
+        run: >-
+          node scripts/update_toolchain_catalog.mjs
+          --runtime-catalog-lock reviewed-runtime/runtime-catalog.lock.json
+
+      - name: Validate generated lock
+        run: >-
+          node scripts/validate_toolchain_catalog.mjs
+          --runtime-catalog-lock reviewed-runtime/runtime-catalog.lock.json
+
+      - name: Open review pull request when the lock changed
+        uses: peter-evans/create-pull-request@v7
+        with:
+          branch: automation/update-toolchain-catalog
+          delete-branch: true
+          title: "chore: update reviewed toolchain catalog"
+          commit-message: |-
+            chore: update reviewed toolchain catalog
+
+            Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+          body: |-
+            Generated from the reviewed runtime lock and official Forge, Fabric,
+            NeoForge, Quilt, and Mojang metadata. Review the exact URLs, sizes,
+            checksums, runtime revision, and supported compatibility tuples before merge.

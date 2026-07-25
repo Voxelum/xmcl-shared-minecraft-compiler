@@ -27,11 +27,11 @@ function primaryCoordinate(minecraftVersion, loader) {
     case "forge":
       return `net.minecraftforge:forge:${minecraftVersion}-${loader.version}:installer`;
     case "fabric":
-      return `net.fabricmc:fabric-loader:${loader.version}:server`;
+      return `net.fabricmc:fabric-loader:${loader.version}`;
     case "neoforge":
       return `net.neoforged:neoforge:${loader.version}:installer`;
     case "quilt":
-      return `org.quiltmc:quilt-loader:${loader.version}:server`;
+      return `org.quiltmc:quilt-loader:${loader.version}`;
     default:
       throw new Error("unknown fixture loader");
   }

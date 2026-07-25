@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { CompilerFailure } from "./bundle.mjs";
+import { catalogRevisionFor } from "./toolchain-catalog.mjs";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
@@ -33,6 +34,7 @@ export class ReviewedToolchainCatalog {
   constructor(document) {
     const catalog = parseCatalog(document);
     this.catalogVersion = catalog.catalogVersion;
+    this.catalogRevision = catalog.catalogRevision;
     this.runtimeCatalogRevision = catalog.runtimeCatalogRevision;
     this.approvedArtifactHosts = catalog.approvedArtifactHosts;
     this.toolchains = catalog.toolchains;
@@ -370,10 +372,14 @@ export function validateImmutableContent({ archive, content, descriptor }) {
 }
 
 function parseCatalog(value) {
-  if (!plainObject(value) ||
-    !sameKeys(value, ["schemaVersion", "catalogVersion", "runtimeCatalogRevision",
-      "approvedArtifactHosts", "toolchains"]) ||
-    value.schemaVersion !== 1 || !validIdentifier(value.catalogVersion) ||
+  const legacy = plainObject(value) && sameKeys(value, ["schemaVersion", "catalogVersion",
+    "runtimeCatalogRevision", "approvedArtifactHosts", "toolchains"]);
+  const generated = plainObject(value) && sameKeys(value, ["schemaVersion", "catalogRevision",
+    "runtimeCatalogRevision", "approvedArtifactHosts", "toolchains"]);
+  if (!plainObject(value) || (!legacy && !generated) || value.schemaVersion !== 1 ||
+    (legacy && !validIdentifier(value.catalogVersion)) ||
+    (generated && (!validSha256(value.catalogRevision) ||
+      catalogRevisionFor(value) !== value.catalogRevision.toLowerCase())) ||
     !validSha256(value.runtimeCatalogRevision) ||
     !Array.isArray(value.approvedArtifactHosts) || value.approvedArtifactHosts.length < 1 ||
     !Array.isArray(value.toolchains) || value.toolchains.length < 1 ||
@@ -406,7 +412,8 @@ function parseCatalog(value) {
     return deepFreeze(parsed);
   });
   return deepFreeze({
-    catalogVersion: value.catalogVersion,
+    catalogVersion: legacy ? value.catalogVersion : value.catalogRevision.toLowerCase(),
+    catalogRevision: generated ? value.catalogRevision.toLowerCase() : undefined,
     runtimeCatalogRevision: value.runtimeCatalogRevision.toLowerCase(),
     approvedArtifactHosts,
     toolchains,
@@ -489,11 +496,11 @@ function expectedPrimaryCoordinate(minecraftVersion, loader) {
     case "forge":
       return `net.minecraftforge:forge:${minecraftVersion}-${loader.version}:installer`;
     case "fabric":
-      return `net.fabricmc:fabric-loader:${loader.version}:server`;
+      return `net.fabricmc:fabric-loader:${loader.version}`;
     case "neoforge":
       return `net.neoforged:neoforge:${loader.version}:installer`;
     case "quilt":
-      return `org.quiltmc:quilt-loader:${loader.version}:server`;
+      return `org.quiltmc:quilt-loader:${loader.version}`;
     default:
       throw new CompilerFailure("invalid_reviewed_catalog");
   }
@@ -951,7 +958,8 @@ function validJava(value) {
 }
 
 function validMinecraftVersion(value) {
-  return typeof value === "string" && /^1\.\d+\.\d+$/.test(value);
+  return typeof value === "string" &&
+    /^(?:1\.\d+\.\d+|\d{2}\.\d+(?:\.\d+)?)$/.test(value);
 }
 
 function validLoaderVersion(value) {

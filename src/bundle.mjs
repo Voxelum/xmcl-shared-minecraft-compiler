@@ -277,7 +277,8 @@ function validLoaderVersion(value) {
 }
 
 function validMinecraftVersion(value) {
-  return typeof value === "string" && /^1\.\d+\.\d+$/.test(value);
+  return typeof value === "string" &&
+    /^(?:1\.\d+\.\d+|\d{2}\.\d+(?:\.\d+)?)$/.test(value);
 }
 
 function plainObject(value) {
