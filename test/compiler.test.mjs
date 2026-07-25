@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import test from "node:test";
 import { validateBundle } from "../src/bundle.mjs";
 import { CompilerWorker, verifyGrantSet } from "../src/compiler.mjs";
+import { WorldSeedWorker } from "../src/world-seed.mjs";
 import {
   DeterministicFakeArtifactDownloader,
   DeterministicFakeJreRegistry,
@@ -144,6 +145,28 @@ test("grant verification rejects substituted node or output grants", () => {
     () => verifyGrantSet({ ...grants, grants: [{ ...grants.grants[0], key: "world/revision" }, grants.grants[1]] }, job),
     /invalid_grants/,
   );
+});
+
+test("world seed handling is exact-grant-only and fails closed without a restore adapter", async () => {
+  const archive = Uint8Array.from([1, 2, 3]);
+  const hash = sha(archive);
+  const job = {
+    accountId: "account_1", serviceId: "service_1", seedId: "seed_1", worldName: "World",
+    archive: {
+      key: "shared-hosting/account_1/service_1/world-seeds/seed_1.xmcl-world-seed",
+      sha256: hash, sizeBytes: archive.byteLength,
+    },
+  };
+  const worker = new WorldSeedWorker({
+    controlPlane: {
+      getWorldSeedGrants: async () => ({
+        accountId: job.accountId, serviceId: job.serviceId, seedId: job.seedId,
+        grants: [{ method: "GET", key: job.archive.key, url: "https://object.example/seed", expiresAt: "2026-07-25T00:10:00.000Z" }],
+      }),
+    },
+    fetchImpl: async () => new Response(archive, { headers: { "content-length": String(archive.byteLength) } }),
+  });
+  await assert.rejects(() => worker.run(job), /world_seed_handler_unavailable/);
 });
 
 test("compiler rejects a launcher-provided EULA file", async () => {

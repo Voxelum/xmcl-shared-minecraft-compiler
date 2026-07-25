@@ -40,6 +40,14 @@ runtime descriptor, and generated launcher.
 JRE root, reviewed catalog, or artifact mirror is bundled here; missing or
 invalid injected dependencies return `compiler_unavailable`.
 
+Local-world migration is a separate `.xmcl-world-seed` path. `WorldSeedWorker`
+accepts exactly one control-plane-issued GET grant bound to an account, service,
+seed ID, archive key, size, and SHA-256; it has no list/delete grant and the
+default `FailClosedWorldSeedHandler` cannot unpack or restore anything. A
+production handler must validate the archive again, restore only the selected
+initial world supplied on a first-start command, and atomically refuse existing
+or completed runtime worlds.
+
 ## Deployment prerequisites
 
 - Run the image as the non-root user already declared in the Dockerfile with a
