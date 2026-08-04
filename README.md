@@ -53,8 +53,9 @@ or completed runtime worlds.
 - Run the image as the non-root user already declared in the Dockerfile with a
   read-only root filesystem, an ephemeral writable workspace, no Docker socket,
   no host mounts, and PID/CPU/memory limits.
-- Use mTLS or an equivalent workload identity for the three internal control
-  plane callbacks: grant retrieval, immutable publish, and durable failure
+- Use mTLS or an equivalent workload identity for the four internal control
+  plane callbacks: grant retrieval, durable upload preparation, immutable
+  publish, and durable failure
   reporting. Do not inject browser, node, billing, or object-store master
   credentials.
 - Permit HTTPS egress only to reviewed artifact origins while a future reviewed
@@ -109,7 +110,10 @@ or publish an image, upload content, or provision infrastructure.
 | `POST /v1/compiler-jobs` | authenticated synchronous queue-message consumption |
 
 The HTTP response acknowledges only after the worker has attempted the
-immutable upload and the authenticated callback. A 200 response with
+immutable upload and the authenticated callback. Before the PUT, the worker
+posts its reviewed content digest and descriptor to `uploadPreparationUrl`.
+The control plane durably binds that exact payload and returns a single-key GET
+reconciliation grant. A 200 response with
 `{"status":"failed"}` means the control-plane failure callback was attempted;
 the control plane owns retry policy and must treat
 `compilerRequestId` as an idempotency key. A busy worker returns 429 before
@@ -120,6 +124,14 @@ callback timeout, transport error, or non-2xx response returns
 publication payload for an authenticated control plane to retry as the same
 published event; the worker never sends a contradictory failed callback after
 publication has begun.
+
+After upload preparation begins, a PUT timeout, transport error, non-success
+response (including `412 If-None-Match: *`), or failed reconciliation returns
+`upload_reconciliation_uncertain`, never `failed`. The worker reconciles only
+through that control-plane-issued GET grant, checks the exact object length and
+SHA-256 against the durable binding, and then publishes it. A redelivery that
+receives 412 follows the same path; it never publishes an arbitrary existing
+key. If reconciliation cannot prove the object, retry the same request.
 
 The endpoint accepts only this schema-versioned envelope (additional fields are
 rejected):
@@ -154,16 +166,18 @@ Docker options, or sandbox settings.
 
 Object-grant GET/PUT operations are bounded to 30 seconds and stream the input
 with an exact byte cap; callbacks are bounded to 10 seconds. Timeouts are
-reported through the fixed `compiler_failed` callback path only before
-publication begins. Published-callback delivery is instead reported as
-`published_callback_uncertain` so it can be reconciled safely.
+reported through the fixed `compiler_failed` callback path only before upload
+preparation begins. Published-callback delivery is instead reported as
+`published_callback_uncertain`; upload uncertainty is reported as
+`upload_reconciliation_uncertain` so it can be reconciled safely.
 
 Completion and failure go only to the callback URL configured when the worker
-is composed. A completion includes the validated content and runtime
-descriptor; a failure includes only the fixed failure code. The URL is HTTPS in
-production, cannot contain credentials or a fragment, does not follow
-redirects, and is never read from a job. Callback receivers must authenticate
-and deduplicate the same `compilerRequestId`.
+is composed. Upload preparation uses a separately configured immutable
+`uploadPreparationUrl`; it is HTTPS in production, cannot contain credentials
+or a fragment, does not follow redirects, and is never read from a job. A
+completion includes the validated content and runtime descriptor; a failure
+includes only the fixed failure code. Callback receivers must authenticate and
+deduplicate the same `compilerRequestId`.
 
 ## Service identity and replay protection
 

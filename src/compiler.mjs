@@ -33,6 +33,7 @@ export class CompilerWorker {
   async run(job) {
     let publication;
     let publicationStarted = false;
+    let uploadPreparationStarted = false;
     try {
       validateCompilerJob(job);
       const grants = await this.controlPlane.getGrants(job.deploymentId);
@@ -47,13 +48,29 @@ export class CompilerWorker {
         expectedContentKey: job.expectedContentKey,
       });
       verifyBuiltContent(built, job);
-      await uploadExact(this.fetch, output, built.archive, { timeoutMs: this.requestTimeoutMs });
-      publication = {
-        deploymentId: job.deploymentId,
-        manifestSha256: job.manifestSha256,
-        content: built.content,
-        descriptor: built.descriptor,
-      };
+      publication = publicationForControlPlane(job, built);
+      // The control plane persists this exact binding before a PUT can begin.
+      // If this request or the PUT response is lost, a redelivery can only
+      // reconcile the same digest and descriptor through its GET grant.
+      uploadPreparationStarted = true;
+      const prepared = await this.controlPlane.prepareUpload(publication);
+      const boundPublication = verifyPreparedUpload(prepared, job);
+      if (prepared.status === "upload_prepared") {
+        try {
+          await uploadExact(this.fetch, output, built.archive, {
+            timeoutMs: this.requestTimeoutMs,
+          });
+        } catch {
+          await reconcileExactUpload(this.fetch, prepared.reconciliation, boundPublication, {
+            timeoutMs: this.requestTimeoutMs,
+          });
+        }
+      } else {
+        await reconcileExactUpload(this.fetch, prepared.reconciliation, boundPublication, {
+          timeoutMs: this.requestTimeoutMs,
+        });
+      }
+      publication = boundPublication;
       publicationStarted = true;
       await this.controlPlane.publish(publication);
       return { status: "published", deploymentId: job.deploymentId };
@@ -61,6 +78,15 @@ export class CompilerWorker {
       if (publicationStarted) {
         return {
           status: "published_callback_uncertain",
+          deploymentId: job.deploymentId,
+          manifestSha256: job.manifestSha256,
+          content: publication.content,
+          descriptor: publication.descriptor,
+        };
+      }
+      if (uploadPreparationStarted && publication) {
+        return {
+          status: "upload_reconciliation_uncertain",
           deploymentId: job.deploymentId,
           manifestSha256: job.manifestSha256,
           content: publication.content,
@@ -169,6 +195,86 @@ async function uploadExact(fetchImpl, grant, archive, { timeoutMs = 30_000 } = {
   });
 }
 
+/**
+ * A successful immutable PUT response is not required to reconcile: it is
+ * published normally. Every non-successful/unknown result is treated as
+ * ambiguous instead of as a compile failure, because a proxy can lose a
+ * response after S3 commits the object. The reconciliation GET is issued only
+ * after the control plane durably bound this exact output.
+ */
+async function reconcileExactUpload(fetchImpl, grant, publication, { timeoutMs = 30_000 } = {}) {
+  if (!isExactReconciliationGrant(grant, publication.content.key)) {
+    throw new CompilerFailure("invalid_reconciliation_grant");
+  }
+  await exactRequest(fetchImpl, grant.url, {
+    method: "GET",
+    headers: grant.headers,
+    redirect: "error",
+  }, timeoutMs, "content_reconciliation_failed", async (response) => {
+    if (!response.ok || response.redirected ||
+      (response.url && new URL(response.url).href !== new URL(grant.url).href)) {
+      throw new CompilerFailure("content_reconciliation_failed");
+    }
+    const length = Number(response.headers.get("content-length") ?? 0);
+    if (!Number.isSafeInteger(length) || length !== publication.content.compressedSize) {
+      throw new CompilerFailure("content_reconciliation_failed");
+    }
+    const digest = await hashExactBody(response, publication.content.compressedSize);
+    if (digest !== publication.content.sha256) {
+      throw new CompilerFailure("content_reconciliation_failed");
+    }
+  });
+}
+
+function publicationForControlPlane(job, built) {
+  return {
+    deploymentId: job.deploymentId,
+    manifestSha256: job.manifestSha256,
+    content: {
+      key: built.content.key,
+      sha256: built.content.sha256,
+      compressedSize: built.content.sizeBytes,
+      logicalSize: built.content.entries.reduce((total, entry) => total + entry.sizeBytes, 0),
+      paths: built.content.entries.map((entry) => entry.path),
+    },
+    descriptor: {
+      schemaVersion: 1,
+      minecraftVersion: job.frozenManifest.compatibility.minecraftVersion,
+      java: job.frozenManifest.compatibility.java,
+      runtimeCatalog: {
+        sha256: job.frozenManifest.compatibility.runtimeCatalog.sha256,
+      },
+      loader: {
+        kind: job.frozenManifest.compatibility.loader,
+        version: job.frozenManifest.compatibility.loaderVersion,
+      },
+      launch: {
+        kind: built.descriptor.launch.kind,
+        path: built.descriptor.launch.path,
+        arguments: [...built.descriptor.launch.arguments],
+      },
+      contentSha256: built.content.sha256,
+    },
+  };
+}
+
+function verifyPreparedUpload(value, job) {
+  if (!value || !["upload_prepared", "upload_existing"].includes(value.status) ||
+    value.publication?.deploymentId !== job.deploymentId ||
+    value.publication?.manifestSha256 !== job.manifestSha256 ||
+    value.publication?.content?.key !== job.expectedContentKey ||
+    !validSha256(value.publication.content.sha256) ||
+    !Number.isSafeInteger(value.publication.content.compressedSize) ||
+    value.publication.content.compressedSize < 1 ||
+    !Number.isSafeInteger(value.publication.content.logicalSize) ||
+    value.publication.content.logicalSize < 1 ||
+    !Array.isArray(value.publication.content.paths) ||
+    !value.publication.descriptor || typeof value.publication.descriptor !== "object") {
+    throw new CompilerFailure("invalid_upload_preparation");
+  }
+  return value.publication;
+}
+
 export function validateCompilerJob(job) {
   if (!job || typeof job !== "object" ||
     !validKeySegment(job.accountId) || !validKeySegment(job.serviceId) ||
@@ -209,6 +315,11 @@ function verifyBuiltContent(built, job) {
 function isExactSignedGrant(grant, method) {
   return grant && grant.method === method && typeof grant.key === "string" &&
     exactHttpsUrl(grant.url) && Number.isSafeInteger(grantExpiresAt(grant));
+}
+
+function isExactReconciliationGrant(grant, expectedKey) {
+  return grant && grant.method === "GET" && grant.key === expectedKey &&
+    isExactSignedGrant(grant, "GET") && hasExactHeaders(grant.headers, {});
 }
 
 function classifyFailure(error) {
@@ -295,6 +406,7 @@ async function readExactBody(response, expectedSize) {
     if (bytes.byteLength !== expectedSize) throw new CompilerFailure("input_size_mismatch");
     return bytes;
   }
+
   const reader = response.body.getReader();
   const chunks = [];
   let total = 0;
@@ -320,4 +432,31 @@ async function readExactBody(response, expectedSize) {
     offset += chunk.byteLength;
   }
   return bytes;
+}
+
+async function hashExactBody(response, expectedSize) {
+  if (!response.body?.getReader) {
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    if (bytes.byteLength !== expectedSize) throw new CompilerFailure("content_reconciliation_failed");
+    return sha256(bytes);
+  }
+  const hash = createHash("sha256");
+  const reader = response.body.getReader();
+  let total = 0;
+  try {
+    while (true) {
+      const next = await reader.read();
+      if (next.done) break;
+      if (!(next.value instanceof Uint8Array)) {
+        throw new CompilerFailure("content_reconciliation_failed");
+      }
+      total += next.value.byteLength;
+      if (total > expectedSize) throw new CompilerFailure("content_reconciliation_failed");
+      hash.update(next.value);
+    }
+  } finally {
+    reader.releaseLock?.();
+  }
+  if (total !== expectedSize) throw new CompilerFailure("content_reconciliation_failed");
+  return hash.digest("hex");
 }

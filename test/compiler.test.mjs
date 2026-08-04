@@ -220,6 +220,7 @@ test("reviewed builder uploads only the immutable output grant and publishes val
   const worker = new CompilerWorker({
     controlPlane: {
       getGrants: async () => grants,
+      prepareUpload: async (publication) => prepared(publication),
       publish: async (publication) => publications.push(publication),
       failed: async () => assert.fail("a reviewed successful build must not fail"),
     },
@@ -241,8 +242,8 @@ test("reviewed builder uploads only the immutable output grant and publishes val
   assert.deepEqual(requests[1].options.headers, { "if-none-match": "*" });
   assert.equal(publications.length, 1);
   assert.equal(publications[0].content.key, job.expectedContentKey);
-  assert.ok(publications[0].content.entries.some((entry) => entry.path === ".xmcl/runtime.json"));
-  assert.ok(publications[0].content.entries.some((entry) => entry.path === ".xmcl/launch.sh"));
+  assert.ok(publications[0].content.paths.includes(".xmcl/runtime.json"));
+  assert.ok(publications[0].content.paths.includes(".xmcl/launch.sh"));
 });
 
 test("an installer failure never uploads or publishes content", async () => {
@@ -253,6 +254,7 @@ test("an installer failure never uploads or publishes content", async () => {
   const worker = new CompilerWorker({
     controlPlane: {
       getGrants: async () => grants,
+      prepareUpload: async (publication) => prepared(publication),
       publish: async (publication) => publications.push(publication),
       failed: async (failure) => failures.push(failure),
     },
@@ -358,6 +360,126 @@ test("reviewed artifact validation failures never upload or publish content", as
     assert.deepEqual(publications, [], scenario.name);
   }
 });
+
+test("an upload timeout reconciles the exact durable binding without a failed callback", async () => {
+  const { archive, job, grants } = fixture();
+  const artifact = Uint8Array.from([4, 5, 6]);
+  const built = [];
+  const failures = [];
+  let uploads = 0;
+  const worker = new CompilerWorker({
+    controlPlane: {
+      getGrants: async () => grants,
+      prepareUpload: async (publication) => {
+        built.push(publication);
+        return prepared(publication);
+      },
+      publish: async (publication) => {
+        assert.deepEqual(publication, built[0]);
+      },
+      failed: async (failure) => failures.push(failure),
+    },
+    builder: reviewedBuilder({
+      artifact,
+      coordinate: "net.fabricmc:fabric-loader:0.16.10",
+      fail: false,
+    }),
+    fetchImpl: async (url, options) => {
+      if (url === grants.grants[0].url) {
+        return new Response(archive, {
+          headers: { "content-length": String(archive.length) },
+        });
+      }
+      if (url === grants.grants[1].url && options.method === "PUT") {
+        uploads += 1;
+        throw new Error("response lost after object storage accepted the PUT");
+      }
+      if (options.method === "GET" && url === "https://object.example/reconcile") {
+        const published = built[0];
+        return new Response(new Uint8Array(0), {
+          headers: { "content-length": String(published.content.compressedSize) },
+        });
+      }
+      assert.fail(`unexpected request ${options.method} ${url}`);
+    },
+  });
+  // The GET body needs the archive hash; use the worker's deterministic
+  // archive from a first build rather than treating arbitrary bytes as valid.
+  const originalFetch = worker.fetch;
+  let output;
+  worker.fetch = async (url, options) => {
+    if (url === grants.grants[1].url && options.method === "PUT") {
+      uploads += 1;
+      output = options.body;
+      throw new Error("response lost after object storage accepted the PUT");
+    }
+    if (options.method === "GET" && url === "https://object.example/reconcile") {
+      return new Response(output, {
+        headers: { "content-length": String(output.byteLength) },
+      });
+    }
+    return originalFetch(url, options);
+  };
+  const result = await worker.run(job);
+  assert.deepEqual(result, { status: "published", deploymentId: job.deploymentId });
+  assert.equal(uploads, 1);
+  assert.deepEqual(failures, []);
+});
+
+test("an immutable 412 reconciles a prior exact binding on redelivery", async () => {
+  const { archive, job, grants } = fixture();
+  const artifact = Uint8Array.from([4, 5, 6]);
+  let stored;
+  const publications = [];
+  const worker = new CompilerWorker({
+    controlPlane: {
+      getGrants: async () => grants,
+      prepareUpload: async (publication) => prepared(publication),
+      publish: async (publication) => publications.push(publication),
+      failed: async () => assert.fail("an already-existing object must not fail"),
+    },
+    builder: reviewedBuilder({
+      artifact,
+      coordinate: "net.fabricmc:fabric-loader:0.16.10",
+      fail: false,
+    }),
+    fetchImpl: async (url, options) => {
+      if (url === grants.grants[0].url) {
+        return new Response(archive, {
+          headers: { "content-length": String(archive.length) },
+        });
+      }
+      if (url === grants.grants[1].url && options.method === "PUT") {
+        stored = options.body;
+        return new Response(null, { status: 412 });
+      }
+      if (url === "https://object.example/reconcile" && options.method === "GET") {
+        return new Response(stored, {
+          headers: { "content-length": String(stored.byteLength) },
+        });
+      }
+      assert.fail(`unexpected request ${options.method} ${url}`);
+    },
+  });
+  assert.deepEqual(
+    await worker.run(job),
+    { status: "published", deploymentId: job.deploymentId },
+  );
+  assert.equal(publications.length, 1);
+});
+
+function prepared(publication) {
+  return {
+    status: "upload_prepared",
+    publication,
+    reconciliation: {
+      key: publication.content.key,
+      method: "GET",
+      url: "https://object.example/reconcile",
+      expiresAt: "2026-07-25T00:10:00.000Z",
+    },
+  };
+}
 
 function reviewedBuilder({ artifact, coordinate, fail, artifactDownloader }) {
   const jre = Uint8Array.from([7, 8, 9]);

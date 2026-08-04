@@ -70,7 +70,7 @@ export class CompilerHttpWorker {
     this.activeJobs += 1;
     try {
       const controlPlane = new CallbackBoundControlPlane({
-        callback: this.composition.callback,
+        callbacks: this.composition.callbacks,
         grants: async (deploymentId) => ({
           grants: envelope.grants,
           job: envelope.job,
@@ -154,8 +154,14 @@ function createComposition(options, now, allowInsecureForTests) {
       !validAuthenticator(options.requestAuthenticator, allowInsecureForTests)) {
       return undefined;
     }
-    const callback = new AuthenticatedCallback({
+    const published = new AuthenticatedCallback({
       ...options.callback,
+      now,
+      allowInsecureForTests,
+    });
+    const uploadPreparation = new AuthenticatedCallback({
+      ...options.callback,
+      url: options.callback?.uploadPreparationUrl,
       now,
       allowInsecureForTests,
     });
@@ -166,7 +172,7 @@ function createComposition(options, now, allowInsecureForTests) {
         sandboxRunner: options.sandboxAdapter,
         artifactDownloader: options.artifactDownloader,
       }),
-      callback,
+      callbacks: { published, uploadPreparation },
       fetchImpl: options.fetchImpl,
       requestAuthenticator: options.requestAuthenticator,
     };
@@ -176,9 +182,12 @@ function createComposition(options, now, allowInsecureForTests) {
 }
 
 class CallbackBoundControlPlane {
-  constructor({ callback, grants, now }) {
+  constructor({ callbacks, grants, now }) {
     if (typeof grants !== "function") throw new TypeError("missing exact grant provider");
-    this.callback = callback;
+    if (!callbacks?.published || !callbacks?.uploadPreparation) {
+      throw new TypeError("missing authenticated callbacks");
+    }
+    this.callbacks = callbacks;
     this.grants = grants;
     this.now = now;
   }
@@ -199,7 +208,7 @@ class CallbackBoundControlPlane {
       publication.content?.key !== job.expectedContentKey) {
       throw new CompilerFailure("invalid_publication");
     }
-    await this.callback.post({
+    await this.callbacks.published.post({
       schemaVersion: 1,
       status: "published",
       compilerRequestId: job.compilerRequestId,
@@ -210,6 +219,25 @@ class CallbackBoundControlPlane {
     });
   }
 
+  async prepareUpload(publication) {
+    const { job } = await this.grants(publication?.deploymentId);
+    if (!publication || publication.deploymentId !== job.deploymentId ||
+      publication.manifestSha256 !== job.manifestSha256 ||
+      publication.content?.key !== job.expectedContentKey) {
+      throw new CompilerFailure("invalid_upload_preparation");
+    }
+    const response = await this.callbacks.uploadPreparation.post({
+      schemaVersion: 1,
+      status: "upload_prepared",
+      compilerRequestId: job.compilerRequestId,
+      deploymentId: job.deploymentId,
+      manifestSha256: job.manifestSha256,
+      content: publication.content,
+      descriptor: publication.descriptor,
+    });
+    return await parseUploadPreparation(response, job);
+  }
+
   async failed(failure) {
     const { job } = await this.grants(failure?.deploymentId);
     if (!failure || failure.deploymentId !== job.deploymentId ||
@@ -217,7 +245,7 @@ class CallbackBoundControlPlane {
       !["unsupported_compatibility", "compiler_unavailable", "compiler_failed"].includes(failure.code)) {
       throw new CompilerFailure("invalid_failure_callback");
     }
-    await this.callback.post({
+    await this.callbacks.published.post({
       schemaVersion: 1,
       status: "failed",
       compilerRequestId: job.compilerRequestId,
@@ -296,13 +324,67 @@ class AuthenticatedCallback {
         (response.url && new URL(response.url).href !== this.url)) {
         throw new CompilerFailure("callback_delivery_failed");
       }
+      return response;
     } catch (error) {
       if (error instanceof CompilerFailure) throw error;
       throw new CompilerFailure("callback_delivery_failed");
     } finally {
       clearTimeout(timeout);
     }
+
   }
+}
+
+async function parseUploadPreparation(response, job) {
+  const length = response.headers.get("content-length");
+  if (length !== null && (!/^(?:0|[1-9]\d*)$/.test(length) ||
+    Number(length) > MAX_CALLBACK_BYTES)) {
+    throw new CompilerFailure("invalid_upload_preparation");
+  }
+  let value;
+  try {
+    const raw = await response.text();
+    if (encoder.encode(raw).byteLength > MAX_CALLBACK_BYTES) throw new Error("oversized");
+    value = JSON.parse(raw);
+  } catch {
+    throw new CompilerFailure("invalid_upload_preparation");
+  }
+  if (!plainObject(value) || !sameKeys(value, [
+    "schemaVersion", "status", "compilerRequestId", "deploymentId",
+    "manifestSha256", "content", "descriptor", "reconciliation",
+  ]) || value.schemaVersion !== 1 ||
+    !["upload_prepared", "upload_existing"].includes(value.status) ||
+    value.compilerRequestId !== job.compilerRequestId ||
+    value.deploymentId !== job.deploymentId ||
+    value.manifestSha256 !== job.manifestSha256 ||
+    !plainObject(value.content) || !plainObject(value.descriptor) ||
+    !plainObject(value.reconciliation) ||
+    value.content.key !== job.expectedContentKey ||
+    !validSha256(value.content.sha256) ||
+    !Number.isSafeInteger(value.content.compressedSize) ||
+    value.content.compressedSize < 1 ||
+    !Number.isSafeInteger(value.content.logicalSize) ||
+    value.content.logicalSize < 1 ||
+    !Array.isArray(value.content.paths) ||
+    !isReconciliationGrant(value.reconciliation, job.expectedContentKey)) {
+    throw new CompilerFailure("invalid_upload_preparation");
+  }
+  return {
+    status: value.status,
+    publication: {
+      deploymentId: value.deploymentId,
+      manifestSha256: value.manifestSha256,
+      content: value.content,
+      descriptor: value.descriptor,
+    },
+    reconciliation: value.reconciliation,
+  };
+}
+
+function isReconciliationGrant(value, expectedKey) {
+  return value.key === expectedKey && value.method === "GET" &&
+    exactHttpsUrl(value.url) && Number.isSafeInteger(Date.parse(value.expiresAt)) &&
+    value.headers === undefined;
 }
 
 function parseEnvelope(body, now) {
@@ -433,6 +515,19 @@ class HttpWorkerError extends Error {
 function validId(value) {
   return typeof value === "string" && value.length > 0 && value.length <= 255 &&
     !/[\x00-\x1f\x7f]/.test(value);
+}
+
+function validSha256(value) {
+  return typeof value === "string" && /^[a-f0-9]{64}$/i.test(value);
+}
+
+function exactHttpsUrl(value) {
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" && !url.username && !url.password && !url.hash;
+  } catch {
+    return false;
+  }
 }
 
 function plainObject(value) {

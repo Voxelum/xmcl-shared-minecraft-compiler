@@ -27,8 +27,27 @@ test("authenticated HTTP worker validates grants, uses the fake isolated sandbox
         headers: request.headers,
         body,
       });
-      callbackEvents.push(JSON.parse(new TextDecoder().decode(body)));
-      response.writeHead(204).end();
+      const event = JSON.parse(new TextDecoder().decode(body));
+      if (event.status === "upload_prepared") {
+        response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({
+          schemaVersion: 1,
+          status: "upload_prepared",
+          compilerRequestId: event.compilerRequestId,
+          deploymentId: event.deploymentId,
+          manifestSha256: event.manifestSha256,
+          content: event.content,
+          descriptor: event.descriptor,
+          reconciliation: {
+            key: event.content.key,
+            method: "GET",
+            url: "https://object.example/reconcile",
+            expiresAt: new Date(Date.now() + 60_000).toISOString(),
+          },
+        }));
+      } else {
+        callbackEvents.push(event);
+        response.writeHead(204).end();
+      }
     } catch {
       response.writeHead(401).end();
     }
@@ -45,6 +64,8 @@ test("authenticated HTTP worker validates grants, uses the fake isolated sandbox
     requestAuthenticator: requestVerifier,
     callback: {
       url: `http://127.0.0.1:${callbackAddress.port}/compiler-callback`,
+      uploadPreparationUrl:
+        `http://127.0.0.1:${callbackAddress.port}/compiler-upload-prepared`,
       authenticator: callbackSigner,
     },
     fetchImpl: objectStore(fixture),
@@ -188,6 +209,7 @@ test("in-memory HMAC replay state cannot compose a production-ready worker", () 
     requestAuthenticator: localHmac,
     callback: {
       url: "https://control-plane.example/compiler-callback",
+      uploadPreparationUrl: "https://control-plane.example/compiler-upload-prepared",
       authenticator: identity("callback", secret),
     },
   });
@@ -207,8 +229,27 @@ test("a published callback with a lost response never emits a failed callback", 
       headers: request.headers,
       body,
     });
-    callbackEvents.push(JSON.parse(new TextDecoder().decode(body)));
-    response.writeHead(204).end();
+    const event = JSON.parse(new TextDecoder().decode(body));
+    if (event.status === "upload_prepared") {
+      response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({
+        schemaVersion: 1,
+        status: "upload_prepared",
+        compilerRequestId: event.compilerRequestId,
+        deploymentId: event.deploymentId,
+        manifestSha256: event.manifestSha256,
+        content: event.content,
+        descriptor: event.descriptor,
+        reconciliation: {
+          key: event.content.key,
+          method: "GET",
+          url: "https://object.example/reconcile",
+          expiresAt: new Date(Date.now() + 60_000).toISOString(),
+        },
+      }));
+    } else {
+      callbackEvents.push(event);
+      response.writeHead(204).end();
+    }
   });
   const callbackAddress = await listen(callbackServer);
   t.after(() => close(callbackServer));
@@ -219,10 +260,15 @@ test("a published callback with a lost response never emits a failed callback", 
     requestAuthenticator: identity("control-plane", secret),
     callback: {
       url: `http://127.0.0.1:${callbackAddress.port}/compiler-callback`,
+      uploadPreparationUrl:
+        `http://127.0.0.1:${callbackAddress.port}/compiler-upload-prepared`,
       authenticator: identity("callback", secret),
       fetchImpl: async (url, options) => {
-        await fetch(url, options);
-        throw new Error("simulated response loss after callback acceptance");
+        const accepted = await fetch(url, options);
+        if (url.endsWith("/compiler-callback")) {
+          throw new Error("simulated response loss after callback acceptance");
+        }
+        return accepted;
       },
     },
     fetchImpl: objectStore(fixture),
